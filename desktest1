@@ -5,8 +5,7 @@ $loDir = "C:\Program Files\LibreOffice\program"
 # Desktop targets (include both common public desktop paths)
 $targets = @(
     "C:\Users\adult\Desktop",
-    "C:\Users\Public\Desktop",
-    "C:\Users\Public\Public Desktop"
+    "C:\Users\Public\Desktop"
 ) | Select-Object -Unique
 
 $apps = @(
