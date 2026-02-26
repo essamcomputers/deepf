@@ -1,0 +1,50 @@
+# Create-LibreOffice-Shortcuts.ps1
+
+$loDir = "C:\Program Files\LibreOffice\program"
+
+# Desktop targets (include both common public desktop paths)
+$targets = @(
+    "C:\Users\adult\Desktop",
+    "C:\Users\Public\Desktop",
+    "C:\Users\Public\Public Desktop"
+) | Select-Object -Unique
+
+$apps = @(
+    @{ Exe="swriter.exe";  Name="WORD"       },
+    @{ Exe="scalc.exe";    Name="EXCEL"      },
+    @{ Exe="simpress.exe"; Name="POWERPOINT" }
+)
+
+if (-not (Test-Path $loDir)) {
+    Write-Error "LibreOffice folder not found: $loDir"
+    exit 2
+}
+
+$wsh = New-Object -ComObject WScript.Shell
+
+foreach ($desktop in $targets) {
+    if (-not (Test-Path $desktop)) {
+        Write-Warning "Desktop path not found (skipping): $desktop"
+        continue
+    }
+
+    foreach ($a in $apps) {
+        $exePath = Join-Path $loDir $a.Exe
+        if (-not (Test-Path $exePath)) {
+            Write-Warning "Missing: $exePath (skipping)"
+            continue
+        }
+
+        $lnkPath = Join-Path $desktop ($a.Name + ".lnk")
+
+        $sc = $wsh.CreateShortcut($lnkPath)
+        $sc.TargetPath       = $exePath
+        $sc.WorkingDirectory = $loDir
+        $sc.IconLocation     = "$exePath,0"
+        $sc.Save()
+
+        Write-Host "Created: $lnkPath -> $exePath"
+    }
+}
+
+exit 0
