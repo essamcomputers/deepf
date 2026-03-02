@@ -1,6 +1,14 @@
 # DF_RemoveOffice_SetLibreDefaults.ps1
-# Uninstall Office (Click-to-Run + MSI best-effort) and set LibreOffice defaults for Adult user.
-# Log: C:\Windows\Temp\DF_RemoveOffice_SetLibreDefaults.log
+# Single-file Deep Freeze Custom App script:
+# 1) Uninstall Microsoft Office (Click-to-Run + MSI best-effort)
+# 2) Set default Office file associations to LibreOffice (machine defaults)
+# 3) Force Adult user to inherit those defaults (clear per-user UserChoice overrides)
+#
+# Log file: C:\Windows\Temp\DF_RemoveOffice_SetLibreDefaults.log
+#
+# IMPORTANT:
+# - This script does NOT restart the PC.
+# - Some uninstallers may *request* a reboot; we try to suppress it for MSI with /norestart.
 
 $ErrorActionPreference = "Stop"
 $LogPath = "C:\Windows\Temp\DF_RemoveOffice_SetLibreDefaults.log"
@@ -22,6 +30,21 @@ function Run-Exe([string]$FilePath, [string]$Arguments, [int]$TimeoutSec = 7200)
     return $p.ExitCode
 }
 
+function Stop-OfficeProcesses {
+    $procs = @(
+        "winword","excel","powerpnt","outlook","onenote","msaccess",
+        "lync","teams","groove","visio","project","officeclicktorun","setup"
+    )
+    foreach ($name in $procs) {
+        Get-Process -Name $name -ErrorAction SilentlyContinue | ForEach-Object {
+            try {
+                Log "Stopping process: $($_.Name) (PID $($_.Id))"
+                Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+            } catch {}
+        }
+    }
+}
+
 function Ensure-LibreOfficePresent {
     $paths = @(
         "C:\Program Files\LibreOffice\program\soffice.exe",
@@ -36,77 +59,90 @@ function Ensure-LibreOfficePresent {
     throw "LibreOffice not found (soffice.exe). Install LibreOffice first."
 }
 
-function Stop-OfficeProcesses {
-    $procs = @("winword","excel","powerpnt","outlook","onenote","msaccess","lync","teams","groove","visio","project")
-    foreach ($name in $procs) {
-        Get-Process -Name $name -ErrorAction SilentlyContinue | ForEach-Object {
-            try {
-                Log "Stopping process: $($_.Name) (PID $($_.Id))"
-                Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
-            } catch {}
+# -------------------- CLICK-TO-RUN UNINSTALL (BEST EFFORT, NO EXTRA EXE) --------------------
+
+function Ensure-ClickToRunService {
+    $svc = Get-Service -Name "ClickToRunSvc" -ErrorAction SilentlyContinue
+    if ($svc) {
+        if ($svc.Status -ne "Running") {
+            Log "Starting ClickToRunSvc..."
+            try { Start-Service -Name "ClickToRunSvc" -ErrorAction Stop } catch { Log "Could not start ClickToRunSvc: $($_.Exception.Message)" }
+        } else {
+            Log "ClickToRunSvc already running."
         }
+    } else {
+        Log "ClickToRunSvc service not found."
     }
 }
 
-function Get-C2R-ProductReleaseIds {
-    # Common key: HKLM\SOFTWARE\Microsoft\Office\ClickToRun\Configuration -> ProductReleaseIds
-    $key = "HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration"
+function Get-C2R-BaseProductIds {
+    # Reads ProductReleaseIds then normalizes:
+    # "O365ProPlusRetail.16_en-us" -> "O365ProPlusRetail"
     $ids = @()
+    $keys = @(
+        "HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Office\ClickToRun\Configuration"
+    )
 
-    if (Test-Path $key) {
-        try {
-            $v = (Get-ItemProperty $key -ErrorAction Stop).ProductReleaseIds
-            if ($v) {
-                $ids += ($v -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-            }
-        } catch {}
+    foreach ($k in $keys) {
+        if (Test-Path $k) {
+            try {
+                $v = (Get-ItemProperty $k -ErrorAction Stop).ProductReleaseIds
+                if ($v) {
+                    $ids += ($v -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+                }
+            } catch {}
+        }
     }
 
-    # Also check WOW6432Node (occasionally relevant)
-    $key2 = "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Office\ClickToRun\Configuration"
-    if (Test-Path $key2) {
-        try {
-            $v2 = (Get-ItemProperty $key2 -ErrorAction Stop).ProductReleaseIds
-            if ($v2) {
-                $ids += ($v2 -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-            }
-        } catch {}
-    }
+    $base = $ids | ForEach-Object { ($_ -split "\.")[0].Trim() } |
+        Where-Object { $_ } | Select-Object -Unique
 
-    $ids = $ids | Select-Object -Unique
-    return $ids
+    return $base
 }
 
 function Uninstall-Office-C2R-BestEffort {
     $c2rExe = "C:\Program Files\Common Files\Microsoft Shared\ClickToRun\OfficeClickToRun.exe"
     if (-not (Test-Path $c2rExe)) {
-        Log "OfficeClickToRun.exe not found. Skipping C2R scenario uninstall."
+        Log "OfficeClickToRun.exe not found. Skipping C2R uninstall."
         return
     }
 
-    $products = Get-C2R-ProductReleaseIds
+    Ensure-ClickToRunService
+
+    $products = Get-C2R-BaseProductIds
     if (-not $products -or $products.Count -eq 0) {
-        Log "No ProductReleaseIds found. Attempting ARP-based uninstall strings later."
+        Log "No C2R ProductReleaseIds found (or couldn't read them). Skipping C2R uninstall."
         return
     }
 
-    Log "C2R ProductReleaseIds detected: $($products -join ', ')"
+    Log "C2R base product IDs to remove: $($products -join ', ')"
 
-    # Build uninstall calls: OfficeClickToRun.exe scenario=install scenariosubtype=ARP ...
-    # NOTE: culture/version values are not always required, but commonly used.
     foreach ($prod in $products) {
         try {
-            $args = "scenario=install scenariosubtype=ARP sourcetype=None productstoremove=$prod " +
-                    "culture=en-us version.16=16.0 DisplayLevel=False ForceAppShutdown=True"
+            # ARP uninstall scenario used by Click-to-Run
+            $args = @(
+                "scenario=install",
+                "scenariosubtype=ARP",
+                "sourcetype=None",
+                "productstoremove=$prod",
+                "DisplayLevel=False",
+                "ForceAppShutdown=True"
+            ) -join " "
+
+            Log "Attempting C2R uninstall for: $prod"
             Run-Exe -FilePath $c2rExe -Arguments $args -TimeoutSec 7200 | Out-Null
-        } catch {
-            Log "C2R uninstall attempt failed for product '$prod': $($_.Exception.Message)"
+        }
+        catch {
+            Log "C2R uninstall failed for '$prod': $($_.Exception.Message)"
         }
     }
 }
 
+# -------------------- MSI / ARP UNINSTALL STRINGS (BEST EFFORT) --------------------
+
 function Uninstall-Office-FromUninstallStrings {
-    # Avoid Win32_Product.
+    # Avoid Win32_Product (slow + can trigger repairs). Use registry uninstall strings.
     $roots = @(
         "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
         "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
@@ -157,24 +193,28 @@ function Uninstall-Office-FromUninstallStrings {
             continue
         }
 
-        # If it's msiexec, enforce silent flags
         if ($cmd -match "msiexec(\.exe)?") {
+            # Normalize to /X and ensure silent + no restart
             $cmd2 = $cmd
             $cmd2 = $cmd2 -replace "\s/ I\s", " /X " -replace "\s/I\s", " /X "
             if ($cmd2 -notmatch "/qn") { $cmd2 += " /qn" }
             if ($cmd2 -notmatch "/norestart") { $cmd2 += " /norestart" }
+
             Log "Executing MSI uninstall: $cmd2"
             Run-Exe -FilePath "cmd.exe" -Arguments "/c $cmd2" -TimeoutSec 7200 | Out-Null
         }
         else {
-            # Best effort non-msi: try quiet
+            # Best-effort: attempt to append /quiet if no silent flag present
             $silent = $cmd
             if ($silent -notmatch "(?i)/quiet|/qn|/s|/silent") { $silent += " /quiet" }
+
             Log "Executing non-MSI uninstall (best-effort): $silent"
             Run-Exe -FilePath "cmd.exe" -Arguments "/c $silent" -TimeoutSec 7200 | Out-Null
         }
     }
 }
+
+# -------------------- DEFAULT APPS -> LIBREOFFICE (MACHINE DEFAULTS) --------------------
 
 function Import-DefaultAppAssociations-LibreOffice {
     $dism = Join-Path $env:SystemRoot "System32\dism.exe"
@@ -182,7 +222,7 @@ function Import-DefaultAppAssociations-LibreOffice {
 
     $xmlPath = Join-Path $env:TEMP "DefaultAppAssociations-LibreOffice.xml"
 
-    # Common LibreOffice ProgIDs (usually correct when LO installed normally)
+    # Common LibreOffice ProgIDs (typical LO installs)
     $xml = @"
 <?xml version="1.0" encoding="UTF-8"?>
 <DefaultAssociations>
@@ -210,10 +250,12 @@ function Import-DefaultAppAssociations-LibreOffice {
     Log "Imported machine default app associations (LibreOffice)."
 }
 
+# -------------------- FORCE 'ADULT' USER TO INHERIT DEFAULTS --------------------
+
 function Clear-UserChoiceOverridesForProfile([string]$ProfilePath) {
     $ntuser = Join-Path $ProfilePath "NTUSER.DAT"
     if (-not (Test-Path $ntuser)) {
-        Log "Hive not found: $ntuser (skipping)"
+        Log "Hive not found: $ntuser (skipping per-user override cleanup)"
         return
     }
 
@@ -248,24 +290,25 @@ function Clear-UserChoiceOverridesForProfile([string]$ProfilePath) {
     }
 }
 
-# ---------------- MAIN ----------------
+# -------------------- MAIN --------------------
+
 Log "==== START Remove Office + Set LibreOffice Defaults ===="
+Log "Log file: $LogPath"
 
 try {
     Ensure-LibreOfficePresent
     Stop-OfficeProcesses
 
-    # 1) Try Click-to-Run scenario uninstall using built-in OfficeClickToRun.exe
+    # 1) Try Click-to-Run uninstall via built-in OfficeClickToRun.exe
     Uninstall-Office-C2R-BestEffort
 
-    # 2) MSI + other ARP uninstall strings (also catches Visio/Project)
+    # 2) MSI + other ARP uninstall strings
     Uninstall-Office-FromUninstallStrings
 
-    # 3) Set machine defaults to LibreOffice (new users + users without overrides)
+    # 3) Set machine defaults to LibreOffice
     Import-DefaultAppAssociations-LibreOffice
 
-    # 4) Force Adult user to inherit (clear UserChoice overrides)
-    # If your Adult profile folder is different, adjust here.
+    # 4) Force Adult to inherit defaults
     $adultProfile = "C:\Users\Adult"
     Clear-UserChoiceOverridesForProfile -ProfilePath $adultProfile
 
