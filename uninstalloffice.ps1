@@ -1,14 +1,15 @@
 # DF_RemoveOffice_SetLibreDefaults.ps1
-# Single-file Deep Freeze Custom App script:
-# 1) Uninstall Microsoft Office (Click-to-Run + MSI best-effort)
-# 2) Set default Office file associations to LibreOffice (machine defaults)
-# 3) Force Adult user to inherit those defaults (clear per-user UserChoice overrides)
+# One-file Deep Freeze Custom App script (no uploaded EXEs):
+# - Downloads Office Deployment Tool (ODT) inside the script
+# - Uses ODT to remove Click-to-Run Office (<Remove All="TRUE" />)
+# - Removes MSI Office (best-effort)
+# - Sets LibreOffice default file associations (machine defaults) + forces Adult to inherit
 #
-# Log file: C:\Windows\Temp\DF_RemoveOffice_SetLibreDefaults.log
+# Log: C:\Windows\Temp\DF_RemoveOffice_SetLibreDefaults.log
 #
-# IMPORTANT:
-# - This script does NOT restart the PC.
-# - Some uninstallers may *request* a reboot; we try to suppress it for MSI with /norestart.
+# NOTES:
+# - Script does NOT restart the machine.
+# - Some uninstallers may request a reboot; script does not initiate it.
 
 $ErrorActionPreference = "Stop"
 $LogPath = "C:\Windows\Temp\DF_RemoveOffice_SetLibreDefaults.log"
@@ -31,10 +32,7 @@ function Run-Exe([string]$FilePath, [string]$Arguments, [int]$TimeoutSec = 7200)
 }
 
 function Stop-OfficeProcesses {
-    $procs = @(
-        "winword","excel","powerpnt","outlook","onenote","msaccess",
-        "lync","teams","groove","visio","project","officeclicktorun","setup"
-    )
+    $procs = @("winword","excel","powerpnt","outlook","onenote","msaccess","visio","project","officeclicktorun","teams","groove")
     foreach ($name in $procs) {
         Get-Process -Name $name -ErrorAction SilentlyContinue | ForEach-Object {
             try {
@@ -59,97 +57,129 @@ function Ensure-LibreOfficePresent {
     throw "LibreOffice not found (soffice.exe). Install LibreOffice first."
 }
 
-# -------------------- CLICK-TO-RUN UNINSTALL (BEST EFFORT, NO EXTRA EXE) --------------------
+function Ensure-Tls12 {
+    try {
+        # Some estates default to TLS 1.0/1.1; enforce TLS 1.2 for Microsoft downloads
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Log "TLS set to 1.2"
+    } catch {
+        Log "Could not set TLS 1.2: $($_.Exception.Message)"
+    }
+}
 
-function Ensure-ClickToRunService {
-    $svc = Get-Service -Name "ClickToRunSvc" -ErrorAction SilentlyContinue
-    if ($svc) {
-        if ($svc.Status -ne "Running") {
-            Log "Starting ClickToRunSvc..."
-            try { Start-Service -Name "ClickToRunSvc" -ErrorAction Stop } catch { Log "Could not start ClickToRunSvc: $($_.Exception.Message)" }
-        } else {
-            Log "ClickToRunSvc already running."
+function Download-File($Url, $OutFile) {
+    Log "Downloading: $Url -> $OutFile"
+    Ensure-Tls12
+    try {
+        Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing -ErrorAction Stop
+    } catch {
+        # Fallback for older PS / locked-down IE components
+        Log "Invoke-WebRequest failed, trying BITS: $($_.Exception.Message)"
+        Start-BitsTransfer -Source $Url -Destination $OutFile -ErrorAction Stop
+    }
+}
+
+function Get-ODT-DownloadUrl {
+    # Microsoft Download Center entry for ODT (id=49117)
+    # We scrape the page for the actual download link, because the direct file name can change.
+    $page = "https://www.microsoft.com/en-us/download/details.aspx?id=49117"
+    Log "Fetching ODT download page: $page"
+    Ensure-Tls12
+    $html = Invoke-WebRequest -Uri $page -UseBasicParsing -ErrorAction Stop
+
+    # Look for a download link ending in .exe that contains "officedeploymenttool" or similar patterns.
+    $links = @()
+    foreach ($l in $html.Links) {
+        if ($l.href -and $l.href -match "\.exe($|\?)") {
+            $links += $l.href
         }
+    }
+    $links = $links | Select-Object -Unique
+
+    # Prefer links that look like ODT
+    $preferred = $links | Where-Object { $_ -match "(?i)officedeploymenttool|odt|office" } | Select-Object -First 1
+    if ($preferred) {
+        Log "Found ODT EXE link (preferred): $preferred"
+        return $preferred
+    }
+
+    $anyExe = $links | Select-Object -First 1
+    if ($anyExe) {
+        Log "Found EXE link (fallback): $anyExe"
+        return $anyExe
+    }
+
+    throw "Could not locate ODT download EXE link on the Microsoft download page."
+}
+
+function Get-ODT-SetupExePath {
+    # Downloads ODT EXE, extracts it to a temp folder, and returns the path to setup.exe
+    $workRoot = Join-Path $env:TEMP ("ODT_" + ([Guid]::NewGuid().ToString("N")))
+    New-Item -Path $workRoot -ItemType Directory -Force | Out-Null
+
+    $odtStub = Join-Path $workRoot "ODT.exe"
+
+    $url = Get-ODT-DownloadUrl
+    Download-File -Url $url -OutFile $odtStub
+
+    # ODT EXE supports /extract:<path> (commonly)
+    Log "Extracting ODT to: $workRoot"
+    $exit = Run-Exe -FilePath $odtStub -Arguments "/extract:`"$workRoot`" /quiet" -TimeoutSec 600
+    if ($exit -ne 0) {
+        # Some ODT stubs use /extract without /quiet
+        Log "First extract attempt returned $exit. Trying alternate extract args..."
+        $exit2 = Run-Exe -FilePath $odtStub -Arguments "/extract:`"$workRoot`"" -TimeoutSec 600
+        if ($exit2 -ne 0) {
+            throw "ODT extraction failed (exit codes: $exit, $exit2)."
+        }
+    }
+
+    $setup = Join-Path $workRoot "setup.exe"
+    if (-not (Test-Path $setup)) {
+        # Sometimes it extracts into a subfolder; search for setup.exe
+        $setup = Get-ChildItem -Path $workRoot -Filter "setup.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 | ForEach-Object { $_.FullName }
+    }
+
+    if (-not $setup -or -not (Test-Path $setup)) {
+        throw "setup.exe not found after ODT extraction."
+    }
+
+    Log "ODT setup.exe located at: $setup"
+    return $setup
+}
+
+function Uninstall-Office-C2R-WithODT {
+    # Reliable Click-to-Run removal using ODT setup.exe + config XML
+    $setup = Get-ODT-SetupExePath
+
+    $xmlPath = Join-Path $env:TEMP "ODT_Uninstall_AllOffice.xml"
+    $xml = @"
+<Configuration>
+  <Remove All="TRUE" />
+  <Display Level="None" AcceptEULA="TRUE" />
+  <Property Name="FORCEAPPSHUTDOWN" Value="TRUE" />
+</Configuration>
+"@
+    $xml | Out-File -FilePath $xmlPath -Encoding UTF8 -Force
+    Log "ODT uninstall config written: $xmlPath"
+
+    Log "Starting ODT uninstall (Click-to-Run removal)..."
+    $exit = Run-Exe -FilePath $setup -Arguments "/configure `"$xmlPath`"" -TimeoutSec 14400
+    if ($exit -ne 0) {
+        Log "ODT uninstall returned non-zero exit code: $exit"
     } else {
-        Log "ClickToRunSvc service not found."
+        Log "ODT uninstall completed with exit code 0."
     }
 }
-
-function Get-C2R-BaseProductIds {
-    # Reads ProductReleaseIds then normalizes:
-    # "O365ProPlusRetail.16_en-us" -> "O365ProPlusRetail"
-    $ids = @()
-    $keys = @(
-        "HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration",
-        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Office\ClickToRun\Configuration"
-    )
-
-    foreach ($k in $keys) {
-        if (Test-Path $k) {
-            try {
-                $v = (Get-ItemProperty $k -ErrorAction Stop).ProductReleaseIds
-                if ($v) {
-                    $ids += ($v -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-                }
-            } catch {}
-        }
-    }
-
-    $base = $ids | ForEach-Object { ($_ -split "\.")[0].Trim() } |
-        Where-Object { $_ } | Select-Object -Unique
-
-    return $base
-}
-
-function Uninstall-Office-C2R-BestEffort {
-    $c2rExe = "C:\Program Files\Common Files\Microsoft Shared\ClickToRun\OfficeClickToRun.exe"
-    if (-not (Test-Path $c2rExe)) {
-        Log "OfficeClickToRun.exe not found. Skipping C2R uninstall."
-        return
-    }
-
-    Ensure-ClickToRunService
-
-    $products = Get-C2R-BaseProductIds
-    if (-not $products -or $products.Count -eq 0) {
-        Log "No C2R ProductReleaseIds found (or couldn't read them). Skipping C2R uninstall."
-        return
-    }
-
-    Log "C2R base product IDs to remove: $($products -join ', ')"
-
-    foreach ($prod in $products) {
-        try {
-            # ARP uninstall scenario used by Click-to-Run
-            $args = @(
-                "scenario=install",
-                "scenariosubtype=ARP",
-                "sourcetype=None",
-                "productstoremove=$prod",
-                "DisplayLevel=False",
-                "ForceAppShutdown=True"
-            ) -join " "
-
-            Log "Attempting C2R uninstall for: $prod"
-            Run-Exe -FilePath $c2rExe -Arguments $args -TimeoutSec 7200 | Out-Null
-        }
-        catch {
-            Log "C2R uninstall failed for '$prod': $($_.Exception.Message)"
-        }
-    }
-}
-
-# -------------------- MSI / ARP UNINSTALL STRINGS (BEST EFFORT) --------------------
 
 function Uninstall-Office-FromUninstallStrings {
-    # Avoid Win32_Product (slow + can trigger repairs). Use registry uninstall strings.
+    # MSI/perpetual Office removal via registry uninstall strings (best-effort)
     $roots = @(
         "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
         "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
     )
 
     $targets = @()
-
     foreach ($root in $roots) {
         if (-not (Test-Path $root)) { continue }
         Get-ChildItem $root -ErrorAction SilentlyContinue | ForEach-Object {
@@ -180,10 +210,10 @@ function Uninstall-Office-FromUninstallStrings {
         return
     }
 
-    Log "Found $($targets.Count) uninstall entries (ARP)."
-
+    Log "Found $($targets.Count) MSI/ARP uninstall entries."
     foreach ($t in $targets) {
         Log "ARP Target: $($t.DisplayName)"
+
         $cmd = $null
         if ($t.QuietUninstallString) { $cmd = $t.QuietUninstallString }
         elseif ($t.UninstallString)  { $cmd = $t.UninstallString }
@@ -194,35 +224,28 @@ function Uninstall-Office-FromUninstallStrings {
         }
 
         if ($cmd -match "msiexec(\.exe)?") {
-            # Normalize to /X and ensure silent + no restart
             $cmd2 = $cmd
             $cmd2 = $cmd2 -replace "\s/ I\s", " /X " -replace "\s/I\s", " /X "
             if ($cmd2 -notmatch "/qn") { $cmd2 += " /qn" }
             if ($cmd2 -notmatch "/norestart") { $cmd2 += " /norestart" }
 
             Log "Executing MSI uninstall: $cmd2"
-            Run-Exe -FilePath "cmd.exe" -Arguments "/c $cmd2" -TimeoutSec 7200 | Out-Null
+            Run-Exe -FilePath "cmd.exe" -Arguments "/c $cmd2" -TimeoutSec 14400 | Out-Null
         }
         else {
-            # Best-effort: attempt to append /quiet if no silent flag present
             $silent = $cmd
             if ($silent -notmatch "(?i)/quiet|/qn|/s|/silent") { $silent += " /quiet" }
-
-            Log "Executing non-MSI uninstall (best-effort): $silent"
-            Run-Exe -FilePath "cmd.exe" -Arguments "/c $silent" -TimeoutSec 7200 | Out-Null
+            Log "Executing uninstall (best-effort): $silent"
+            Run-Exe -FilePath "cmd.exe" -Arguments "/c $silent" -TimeoutSec 14400 | Out-Null
         }
     }
 }
-
-# -------------------- DEFAULT APPS -> LIBREOFFICE (MACHINE DEFAULTS) --------------------
 
 function Import-DefaultAppAssociations-LibreOffice {
     $dism = Join-Path $env:SystemRoot "System32\dism.exe"
     if (-not (Test-Path $dism)) { throw "DISM not found." }
 
     $xmlPath = Join-Path $env:TEMP "DefaultAppAssociations-LibreOffice.xml"
-
-    # Common LibreOffice ProgIDs (typical LO installs)
     $xml = @"
 <?xml version="1.0" encoding="UTF-8"?>
 <DefaultAssociations>
@@ -242,15 +265,12 @@ function Import-DefaultAppAssociations-LibreOffice {
   <Association Identifier=".odp"  ProgId="LibreOffice.ImpressDocument.1" ApplicationName="LibreOffice Impress" />
 </DefaultAssociations>
 "@
-
     $xml | Out-File -FilePath $xmlPath -Encoding UTF8 -Force
     Log "Created default associations XML: $xmlPath"
 
     Run-Exe -FilePath $dism -Arguments "/Online /Import-DefaultAppAssociations:`"$xmlPath`"" -TimeoutSec 1800 | Out-Null
     Log "Imported machine default app associations (LibreOffice)."
 }
-
-# -------------------- FORCE 'ADULT' USER TO INHERIT DEFAULTS --------------------
 
 function Clear-UserChoiceOverridesForProfile([string]$ProfilePath) {
     $ntuser = Join-Path $ProfilePath "NTUSER.DAT"
@@ -267,7 +287,6 @@ function Clear-UserChoiceOverridesForProfile([string]$ProfilePath) {
 
     try {
         $exts = @(".doc",".docx",".rtf",".xls",".xlsx",".csv",".ppt",".pptx",".odt",".ods",".odp")
-
         foreach ($ext in $exts) {
             $userChoice = "$mountPath\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\$ext\UserChoice"
             if (Test-Path $userChoice) {
@@ -281,7 +300,6 @@ function Clear-UserChoiceOverridesForProfile([string]$ProfilePath) {
                 Run-Exe -FilePath "reg.exe" -Arguments "delete `"$openWith`" /f" -TimeoutSec 60 | Out-Null
             }
         }
-
         Log "Cleared per-user overrides under: $ProfilePath"
     }
     finally {
@@ -290,25 +308,24 @@ function Clear-UserChoiceOverridesForProfile([string]$ProfilePath) {
     }
 }
 
-# -------------------- MAIN --------------------
-
-Log "==== START Remove Office + Set LibreOffice Defaults ===="
+# ---------------- MAIN ----------------
+Log "==== START Remove Office (ODT download) + Set LibreOffice Defaults ===="
 Log "Log file: $LogPath"
 
 try {
     Ensure-LibreOfficePresent
     Stop-OfficeProcesses
 
-    # 1) Try Click-to-Run uninstall via built-in OfficeClickToRun.exe
-    Uninstall-Office-C2R-BestEffort
+    # Reliable Click-to-Run removal without uploading EXEs: download ODT within script
+    Uninstall-Office-C2R-WithODT  # ODT is Microsoft-recommended for C2R removal :contentReference[oaicite:1]{index=1}
 
-    # 2) MSI + other ARP uninstall strings
+    # MSI/perpetual Office cleanup (if any)
     Uninstall-Office-FromUninstallStrings
 
-    # 3) Set machine defaults to LibreOffice
+    # Default associations to LibreOffice
     Import-DefaultAppAssociations-LibreOffice
 
-    # 4) Force Adult to inherit defaults
+    # Force Adult to inherit defaults
     $adultProfile = "C:\Users\Adult"
     Clear-UserChoiceOverridesForProfile -ProfilePath $adultProfile
 
