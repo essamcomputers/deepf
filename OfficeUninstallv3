@@ -1,0 +1,42 @@
+$ErrorActionPreference = "SilentlyContinue"
+
+$RegPaths = @(
+"HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+"HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+)
+
+$C2R = $null
+
+foreach ($Path in $RegPaths) {
+    $apps = Get-ItemProperty "$Path\*" -ErrorAction SilentlyContinue | Where-Object {
+        $_.UninstallString -and $_.UninstallString -match "OfficeClickToRun\.exe"
+    }
+    if ($apps) {
+        $C2R = $apps[0]
+        break
+    }
+}
+
+if (-not $C2R) { exit 0 }
+
+$u = $C2R.UninstallString.Trim()
+
+if ($u.StartsWith('"')) {
+    $exe = $u.Split('"')[1]
+    $args = $u.Substring($exe.Length + 2).Trim()
+} else {
+    $parts = $u.Split(" ",2)
+    $exe = $parts[0]
+    $args = $parts[1]
+}
+
+if ($args -notmatch "DisplayLevel") { $args += " DisplayLevel=False" }
+if ($args -notmatch "ForceAppShutdown") { $args += " ForceAppShutdown=True" }
+if ($args -notmatch "UpdatePromptUser") { $args += " UpdatePromptUser=False" }
+
+$procs = "WINWORD","EXCEL","POWERPNT","OUTLOOK","MSACCESS","MSPUB","ONENOTE","VISIO","WINPROJ","LYNC"
+foreach ($p in $procs) {
+    Get-Process $p -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+}
+
+Start-Process $exe -ArgumentList $args -Wait
